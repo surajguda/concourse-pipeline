@@ -1,0 +1,25 @@
+name: helloworld
+versionTag: "provided by the pipeline with override_values"
+dockerAuthSecretName: "creds-docker-arch-ga" #provide the secret name from vault under ed-assessment
+k8s:
+  roleName: "arch-app"
+  ServiceAccount: "spring-boot-example" # for examples only
+consul:
+  host: 'https://consul.tsg.hmhco.com'
+  port: 443
+vault:
+  address: 'https://vault.br.internal'
+  namespace: "ed-assessment"
+  authRole: "spring-boot-example"
+  secretTokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+  stsBackend: "aws"
+  credentialType: "assumed_role"
+ports:
+  management: 8081
+  container: 8081
+ingressMappings:
+- ambassador_id: internal
+aws:
+  region: 'us-east-1'
+s3:
+  bucket: 'hmheng-infra'

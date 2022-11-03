@@ -1,0 +1,37 @@
+replicas: 1
+env: "tsg-int"
+rollingUpdate:
+  maxSurge: 0
+  maxUnavailable: 1
+consul:
+  prefix: /arch/int
+  role: spring-boot-example-int-arch
+vault:
+  authMountPath: "k8s-tsg-int-eks-cluster"
+  secretMountPath: "int/examples"
+  stsRole: "spring-boot-example-int"
+resources:
+  # update app and sidecar resources based on perf test outcomes.
+  app:
+    requests:
+      memory: 1024Mi
+      cpu: 500m
+    limits:
+      memory: 1024Mi
+      cpu: 500m
+  sidecar_envoy:
+    requests:
+      memory: 50Mi
+      cpu: 100m
+    limits:
+      memory: 50Mi
+      cpu: 100m
+java:
+  opts: -Dserver.tomcat.threads.max=250 -Dmanagement.server.port=8081 -Xmx768m -Dspring.profiles.active=int
+s3:
+  prefix: <S3://Path>
+hpa:
+  enabled: false
+  targetCPU: 50
+  minReplicas: 3
+  maxReplicas: 5

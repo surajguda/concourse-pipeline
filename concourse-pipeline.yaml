@@ -1,0 +1,288 @@
+# Set pipeline:
+
+# - `fly -t tsg set-pipeline -p <YOUR_PIPELINE> -l ci/pipeline-vars.yaml -c ci/concourse-pipeline.yaml -v "namespace=<YOUR_NAMESPACE>" -v pubedu-username=<YOUR_PUBEDU> -v deploy-key=<YOUR_DEPLOY_KEY>`
+# NOTE: deploy-key provided should be a read/write key if you wish to use this pipeline example with the option of pushing tags to your forked ghe repo for builds. Otherwise feel free to disable pushing tags and use a readonly deploy key with this pipeline.
+
+# Examples of how to manually trigger jobs:
+# - Build app, test, build and push docker image to artifactory and deploy to dev, int and cert:
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/build-test-push --watch`
+# - Rerun deployment to cert if it failed (taking the last image tag created):
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/deploy-cert --watch`
+# - Deploy to prod (taking the last image tag created):
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/deploy-prod --watch`
+# - Sync application config to ConsulKV (taking the last image tag created) to dev:
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/sync-app-conf-dev --watch`
+# - Sync application config to ConsulKV (taking the last image tag created) to int:
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/sync-app-conf-int --watch`
+# - Sync application config to ConsulKV (taking the last image tag created) to cert:
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/sync-app-conf-cert --watch`
+# - Sync application config to ConsulKV (taking the last image tag created) to prod:
+#    - `fly -t tsg trigger-job --job <YOUR_APP_NAME>/sync-app-conf-prod --watch`
+
+# Hijack (second job):
+# - `fly -t tsg hijack -j <YOUR_APP_NAME>/build-test-push`
+
+# Delete pipeline (if you created some test pipeline that you no longer need)
+# - `fly -t tsg destroy-pipeline --pipeline <YOUR_APP_NAME>-test`
+
+# Grouping jobs into separate views in UI
+groups:
+  - name: show-all
+    jobs:
+      - "*"
+  - name: deployment-only
+    jobs:
+      - build-test-push
+      - deploy-*
+  - name: consulkv-app-config-sync   # need to know on these why are these used
+    jobs:
+      - sync-app-conf-*
+  - name: pr-triggered
+    jobs:
+      - build-test-pr
+      - build-test-config-pr
+  - name: prod-admin
+    jobs:
+      - list-pods
+      - describe-pods
+      - restart-pods
+
+# Data sources for variables used in this pipeline
+var_sources:
+  # Vault is used in this pipeline to allow CCI to read the private key of the applications GH repo
+  - name: vault
+    type: vault  #This specifies the type of var_source being used and shouldn't be changed.
+    config:
+      url: https://vault.br.internal  #This is the URL of Vault and shouldn't be changed
+      namespace: ((namespace))
+      # Location where the key for the app is stored in Vault
+      path_prefix: common/((app_name))
+      auth_backend: approle  #This is the authentication mechanism being used to access Vault and shouldn't be changed.
+      auth_params:
+        role_id: ((namespace-approle-secret.role_id))  #This is the role_id that's used to access Vault and shouldn't be changed.
+        secret_id: ((namespace-approle-secret.secret_id))  #This is the secret_id that's used to access Vault and shouldn't be changed.
+      ca_cert: ((root_ca))  #This is the CA used when a build authenticated with Vault and shouldn't be changed.
+
+#################
+# RESOURCE TYPES
+#################
+
+# Versions and locations of resources that are used in this pipeline
+resource_types:
+# To pull the source code and watch for changes in GHE repo
+  - name: git
+    type: docker-image
+    source:
+      repository: <Provide the registry name with URL>
+      tag: 1.13.1
+# To listen for new PRs and sync the build status back to the GHE's PR "checks" section
+  - name: pull-request
+    type: docker-image
+    source:
+      repository: <Provide the registry name with URL>
+      tag: 1.0.0
+# To deploy to K8s with Helm
+  - name: helm3
+    type: docker-image
+    source:
+      repository: docker.br.hmheng.io/concourse-resources/production/helm3
+      tag: latest
+# To send notifications to Microsoft Teams
+  - name: teams-notification
+    type: docker-image
+    source:
+      repository: docker.br.hmheng.io/concourse-resources/production/teams-notification-resource
+      tag: 1.0.0
+# To read from and write to ConsulKV (version file with value used as a Docker image tag value)
+  - name: consul-kv  #mention it as an docker image name and mention same in the repository as well
+    type: docker-image
+    source:
+      repository: docker.br.hmheng.io/concourse-resources/production/consul-kv
+      tag: 2.0.2
+# resource for executing kubectl
+  - name: kubernetes
+    type: docker-image
+    source:
+      repository: docker.br.hmheng.io/concourse-resources/production/kubectl
+      tag: latest
+#################
+# RESOURCES
+#################
+# Configuration for resources that are used in the pipeline
+resources:
+  # Source code for the app
+  - name: source-repo
+    type: git
+    icon: github
+    source:
+      uri: git@scm.eng.hmhco.com:Bedrock/((repo_name)).git
+      branch: master
+      private_key: ((deploy-key))
+      ignore_paths:
+        - example/hello-world-springboot-helm/config/*
+
+  # resource to tag releases to github
+  - name: tag
+    type: git
+    icon: github
+    source:
+      uri: git@scm.eng.hmhco.com:Bedrock/((repo_name)).git
+      # use a deploy key with write access so that we could push tags
+      private_key: ((deploy-key))
+      only_tag: true
+      branch: master
+
+# This is a separate repo to only watch for changes to the config files for int
+  - name: source-repo-config-int
+    type: git
+    icon: github
+    source:
+      uri: git@scm.eng.hmhco.com:Bedrock/((repo_name)).git
+      branch: master
+      private_key: ((deploy-key))
+      # only changes to the specified files will yield new versions from check
+      paths:
+        - example/hello-world-springboot-helm/config/int/*
+
+
+# HMH's docker registry (access per namespace)
+  - name: artifactory-docker
+    type: docker-image
+    icon: docker
+    source:
+      repository: docker-((namespace))-ga.br.hmheng.io/((app_name))-((pubedu-username))
+      username: ((docker-ga.user_name))
+      password: ((docker-ga.access_token))
+
+# Helm 3 container to deploy to a given K8s namespace
+  - name: k8s-cluster
+    type: helm3
+    source:
+      release: ((app_name))-((pubedu-username))
+      namespace: ((namespace))
+
+# Writing and reading version files (int)
+  - name: consul-kv-int
+    type: consul-kv
+    source:
+      host: consul.tsg.hmhco.com
+      vault_url: https://vault.br.internal
+      namespace: ((namespace))
+      app_role_id: ((namespace-approle-secret.role_id))
+      app_secret_id: ((namespace-approle-secret.secret_id))
+      # service name format: <app_name>-<env>-<namespace>
+      service: ((app_name))-int-((namespace))
+
+#################
+# JOBS
+#################
+
+jobs:
+  # Pull source code, run task build and test, build image and push to artifactory
+  - name: build-test-push
+    # builds will queue up and execute one-by-one, rather than executing in parallel
+    serial: true
+    # ensure that jobs in `env-deployment` group do not run at the same time
+    serial_groups: [env-deployment]
+    plan:
+      - get: source-repo
+        trigger: true
+      - task: build-app
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: docker.br.hmheng.io/amazon-corretto
+              tag: dind-amazon-corretto-19-20221012165622
+          # This means a directory `source-repo/` will be mounted to the container in this task
+          inputs:
+            - name: source-repo
+          # This ensures that the changes done as part of this task are retained in `source-repo/` for other tasks
+          outputs:
+            - name: source-repo
+          run:
+            path: entrypoint.sh
+            args:
+              - bash
+              - -ceux
+              - sh source-repo/example/hello-world-springboot-helm/ci/build-app.sh
+        on_success:
+          put: tag
+          inputs:
+            - source-repo
+          params:
+            tag: source-repo/example/hello-world-springboot-helm/build/tag_file
+            repository: source-repo
+        on_failure: teams_failure_notification
+      - load_var: version
+        file: source-repo/example/hello-world-springboot-helm/build/tag_file
+      # Build Docker image and push to Artifactory
+      - put: artifactory-docker
+        params:
+          build: source-repo/example/hello-world-springboot-helm/build
+          dockerfile: source-repo/example/hello-world-springboot-helm/build/Dockerfile
+          tag_file: source-repo/example/hello-world-springboot-helm/build/tag_file
+      - put: consul-kv-dev
+        params:
+          key: ((namespace))/dev/((app_name))/last_built_version
+          file: source-repo/example/hello-world-springboot-helm/build/tag_file
+        get_params:
+          key: ((namespace))/dev/((app_name))/last_built_version
+
+
+  - name: deploy-int
+    # builds will queue up and execute one-by-one, rather than executing in parallel
+    serial: true
+    # ensure that jobs in `env-deployment` group do not run at the same time
+    serial_groups: [env-deployment]
+    plan:
+      - get: consul-kv-dev
+        passed: [deploy-dev]
+        trigger: true
+        params:
+          key: ((namespace))/dev/((app_name))/last_deployed_version
+      - get: source-repo
+      # Deploy to K8s INT cluster
+      - put: k8s-cluster
+        params:
+          aws_access_key_id: ((k8s-iam-user.nonprod_access-key-id))
+          aws_secret_access_key: ((k8s-iam-user.nonprod_access-key-secret))
+          kubeconfig: ((kubeconfig.tsg-int))
+          # kubeconfig_path: source-repo/kubeconfig/kubeconfig_k8s-tsg-int-eks-cluster
+          atomic: true
+          chart: source-repo/example/hello-world-springboot-helm/deploy/
+          values:
+            - source-repo/example/hello-world-springboot-helm/deploy/values.yaml
+            - source-repo/example/hello-world-springboot-helm/deploy/values-int.yaml
+          override_values:
+            - key: versionTag
+              path: consul-kv-dev/((namespace))/dev/((app_name))/last_deployed_version
+      # TODO: create a task to run BVT/functional tests against INT deployment
+      # - task: run-bvt
+      # Note: remember to use load_var before consul-kv-dev PUT as PUT resets all the files retrieved with GET
+      - load_var: version
+        file: consul-kv-dev/((namespace))/dev/((app_name))/last_deployed_version
+      # If BVT/functional tests passed fine, push the version number to ConsulKV int
+      - put: consul-kv-int
+        params:
+          key: ((namespace))/int/((app_name))/last_deployed_version
+          file: consul-kv-dev/((namespace))/dev/((app_name))/last_deployed_version
+        get_params:
+          key: ((namespace))/int/((app_name))/last_deployed_version
+
+
+# Pull the app configuration file(s) from a given dir in source repo and sync with Consul KV for int
+  - name: sync-app-conf-int
+    plan:
+      # Only triggered when the config file changes
+      - get: source-repo-config-int
+        trigger: true
+      - put: consul-kv-int
+        params:
+          key: ((namespace))/int/((app_name))/
+          path: source-repo-config-int/example/hello-world-springboot-helm/config/int/
+          sync: true
+        get_params:
+          key: ((namespace))/int/((app_name))/config/application.yaml
